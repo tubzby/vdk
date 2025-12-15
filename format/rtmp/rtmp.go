@@ -770,6 +770,7 @@ func (self *Conn) ReadPacket() (pkt av.Packet, err error) {
 			}
 			if self.prober.Updated {
 				self.streams = self.prober.Streams
+				self.streamsUpdated = true
 				self.prober.Updated = false
 			}
 			continue
@@ -842,11 +843,21 @@ func (self *Conn) Streams() (streams []av.CodecData, err error) {
 }
 
 func (self *Conn) UpdatedStreams() (streams []av.CodecData, ok bool) {
-	if self.prober == nil || !self.prober.Updated {
+	if self.prober == nil {
 		return nil, false
 	}
-	self.streams = self.prober.Streams
-	self.prober.Updated = false
+
+	if self.prober.Updated {
+		self.streams = self.prober.Streams
+		self.prober.Updated = false
+		self.streamsUpdated = true
+	}
+
+	if !self.streamsUpdated {
+		return nil, false
+	}
+
+	self.streamsUpdated = false
 	return self.streams, true
 }
 
