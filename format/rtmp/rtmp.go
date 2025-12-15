@@ -319,6 +319,7 @@ func getTcUrl(u *url.URL) string {
 	app, _ := SplitPath(u)
 	nu := *u
 	nu.Path = "/" + app
+	nu.RawQuery = ""
 	return nu.String()
 }
 
