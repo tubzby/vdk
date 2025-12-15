@@ -70,6 +70,7 @@ type Prober struct {
 	PushedCount                    int
 	Streams                        []av.CodecData
 	CachedPkts                     []av.Packet
+	Updated                        bool
 }
 
 func (self *Prober) CacheTag(_tag flvio.Tag, timestamp int32) {
@@ -78,6 +79,30 @@ func (self *Prober) CacheTag(_tag flvio.Tag, timestamp int32) {
 }
 
 func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
+	// Allow codec updates after initial probe without counting toward the probe limit.
+	if tag.Type == flvio.TAG_VIDEO && tag.AVCPacketType == flvio.AVC_SEQHDR && self.GotVideo {
+		var stream av.CodecData
+		if stream, err = h264parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
+			if stream, err = h265parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
+				err = fmt.Errorf("flv: h264 seqhdr invalid")
+				return
+			}
+		}
+		self.Streams[self.VideoStreamIdx] = stream
+		self.Updated = true
+		return
+	}
+	if tag.Type == flvio.TAG_AUDIO && tag.SoundFormat == flvio.SOUND_AAC && tag.AACPacketType == flvio.AAC_SEQHDR && self.GotAudio {
+		var stream aacparser.CodecData
+		if stream, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(tag.Data); err != nil {
+			err = fmt.Errorf("flv: aac seqhdr invalid")
+			return
+		}
+		self.Streams[self.AudioStreamIdx] = stream
+		self.Updated = true
+		return
+	}
+
 	self.PushedCount++
 
 	if self.PushedCount > MaxProbePacketCount {
@@ -89,18 +114,22 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 	case flvio.TAG_VIDEO:
 		switch tag.AVCPacketType {
 		case flvio.AVC_SEQHDR:
-			if !self.GotVideo {
-				var stream av.CodecData
-				if stream, err = h264parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
-					if stream, err = h265parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
-						err = fmt.Errorf("flv: h264 seqhdr invalid")
-						return
-					}
+			var stream av.CodecData
+			if stream, err = h264parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
+				if stream, err = h265parser.NewCodecDataFromAVCDecoderConfRecord(tag.Data); err != nil {
+					err = fmt.Errorf("flv: h264 seqhdr invalid")
+					return
 				}
+			}
+
+			if self.GotVideo {
+				self.Streams[self.VideoStreamIdx] = stream
+			} else {
 				self.VideoStreamIdx = len(self.Streams)
 				self.Streams = append(self.Streams, stream)
 				self.GotVideo = true
 			}
+			self.Updated = true
 
 		case flvio.AVC_NALU:
 			self.CacheTag(tag, timestamp)
@@ -111,16 +140,20 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 		case flvio.SOUND_AAC:
 			switch tag.AACPacketType {
 			case flvio.AAC_SEQHDR:
-				if !self.GotAudio {
-					var stream aacparser.CodecData
-					if stream, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(tag.Data); err != nil {
-						err = fmt.Errorf("flv: aac seqhdr invalid")
-						return
-					}
+				var stream aacparser.CodecData
+				if stream, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(tag.Data); err != nil {
+					err = fmt.Errorf("flv: aac seqhdr invalid")
+					return
+				}
+
+				if self.GotAudio {
+					self.Streams[self.AudioStreamIdx] = stream
+				} else {
 					self.AudioStreamIdx = len(self.Streams)
 					self.Streams = append(self.Streams, stream)
 					self.GotAudio = true
 				}
+				self.Updated = true
 
 			case flvio.AAC_RAW:
 				self.CacheTag(tag, timestamp)

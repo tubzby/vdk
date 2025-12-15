@@ -141,6 +141,7 @@ type Conn struct {
 	OnPlayOrPublish     func(string, flvio.AMFMap) error
 	prober              *flv.Prober
 	streams             []av.CodecData
+	streamsUpdated      bool
 	txbytes             uint64
 	rxbytes             uint64
 	bufr                *bufio.Reader
@@ -760,6 +761,19 @@ func (self *Conn) ReadPacket() (pkt av.Packet, err error) {
 			return
 		}
 
+		// Refresh codec data if a new sequence header arrives mid-stream.
+		if (tag.Type == flvio.TAG_VIDEO && tag.AVCPacketType == flvio.AVC_SEQHDR) ||
+			(tag.Type == flvio.TAG_AUDIO && tag.SoundFormat == flvio.SOUND_AAC && tag.AACPacketType == flvio.AAC_SEQHDR) {
+			if err = self.prober.PushTag(tag, int32(self.timestamp)); err != nil {
+				return
+			}
+			if self.prober.Updated {
+				self.streams = self.prober.Streams
+				self.prober.Updated = false
+			}
+			continue
+		}
+
 		var ok bool
 		if pkt, ok = self.prober.TagToPacket(tag, int32(self.timestamp)); ok {
 			return
@@ -824,6 +838,15 @@ func (self *Conn) Streams() (streams []av.CodecData, err error) {
 	}
 	streams = self.streams
 	return
+}
+
+func (self *Conn) UpdatedStreams() (streams []av.CodecData, ok bool) {
+	if self.prober == nil || !self.prober.Updated {
+		return nil, false
+	}
+	self.streams = self.prober.Streams
+	self.prober.Updated = false
+	return self.streams, true
 }
 
 func (self *Conn) WritePacket(pkt av.Packet) (err error) {
