@@ -2,15 +2,18 @@ package mp4
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"reflect"
+	"time"
+
 	"github.com/deepch/vdk/av"
 	"github.com/deepch/vdk/codec/aacparser"
 	"github.com/deepch/vdk/codec/h264parser"
 	"github.com/deepch/vdk/codec/h265parser"
 	"github.com/deepch/vdk/format/mp4/mp4io"
 	"github.com/deepch/vdk/utils/bits/pio"
-	"io"
-	"time"
 )
 
 type Muxer struct {
@@ -89,6 +92,8 @@ func (self *Muxer) newStream(codec av.CodecData) (err error) {
 
 	stream.timeScale = 90000
 	stream.muxer = self
+	stream.sampleDescCount = 1
+	stream.currentSampleDescId = 1
 	self.streams = append(self.streams, stream)
 
 	return
@@ -221,6 +226,15 @@ func (self *Stream) writePacket(pkt av.Packet, rawdur time.Duration) (err error)
 		self.sample.SyncSample.Entries = append(self.sample.SyncSample.Entries, uint32(self.sampleIndex+1))
 	}
 
+	if self.switchSampleIndex > 0 && int64(self.sampleIndex)+1 == self.switchSampleIndex {
+		self.sample.SampleToChunk.Entries = append(self.sample.SampleToChunk.Entries, mp4io.SampleToChunkEntry{
+			FirstChunk:      uint32(len(self.sample.ChunkOffset.Entries) + 1),
+			SamplesPerChunk: 1,
+			SampleDescId:    self.currentSampleDescId,
+		})
+		self.switchSampleIndex = 0
+	}
+
 	duration := uint32(self.timeToTs(rawdur))
 	if self.sttsEntry == nil || duration != self.sttsEntry.Duration {
 		self.sample.TimeToSample.Entries = append(self.sample.TimeToSample.Entries, mp4io.TimeToSampleEntry{Duration: duration})
@@ -308,4 +322,106 @@ func (self *Muxer) WriteTrailer() (err error) {
 	}
 
 	return
+}
+
+// UpdateCodec appends a new sample description for the given stream and
+// switches subsequent samples to reference it. Existing samples remain
+// associated with the previous description, allowing mid-stream codec
+// changes (e.g., SPS/PPS/VPS updates) in a single MP4.
+func (self *Muxer) UpdateCodec(idx int, codec av.CodecData) error {
+	if idx < 0 || idx >= len(self.streams) {
+		return fmt.Errorf("mp4: invalid stream index %d", idx)
+	}
+	stream := self.streams[idx]
+
+	if sameCodec(stream.CodecData, codec) {
+		return nil
+	}
+
+	desc, err := buildSampleDesc(codec)
+	if err != nil {
+		return err
+	}
+
+	stream.sampleDescCount++
+	stream.currentSampleDescId = stream.sampleDescCount
+	stream.sample.SampleDesc.Unknowns = append(stream.sample.SampleDesc.Unknowns, desc)
+	stream.CodecData = codec
+	// switch on the next sample written (not the last buffered one)
+	stream.switchSampleIndex = int64(stream.sampleIndex) + 1
+	return nil
+}
+
+func buildSampleDesc(codec av.CodecData) (mp4io.Atom, error) {
+	switch c := codec.(type) {
+	case h264parser.CodecData:
+		width, height := c.Width(), c.Height()
+		return &mp4io.AVC1Desc{
+			DataRefIdx:           1,
+			HorizontalResolution: 72,
+			VorizontalResolution: 72,
+			Width:                int16(width),
+			Height:               int16(height),
+			FrameCount:           1,
+			Depth:                24,
+			ColorTableId:         -1,
+			Conf:                 &mp4io.AVC1Conf{Data: c.AVCDecoderConfRecordBytes()},
+		}, nil
+	case h265parser.CodecData:
+		width, height := c.Width(), c.Height()
+		return &mp4io.HV1Desc{
+			DataRefIdx:           1,
+			HorizontalResolution: 72,
+			VorizontalResolution: 72,
+			Width:                int16(width),
+			Height:               int16(height),
+			FrameCount:           1,
+			Depth:                24,
+			ColorTableId:         -1,
+			Conf:                 &mp4io.HV1Conf{Data: c.AVCDecoderConfRecordBytes()},
+		}, nil
+	case aacparser.CodecData:
+		return &mp4io.MP4ADesc{
+			DataRefIdx:       1,
+			NumberOfChannels: int16(c.ChannelLayout().Count()),
+			SampleSize:       int16(c.SampleFormat().BytesPerSample()),
+			SampleRate:       float64(c.SampleRate()),
+			Conf: &mp4io.ElemStreamDesc{
+				DecConfig: c.MPEG4AudioConfigBytes(),
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("mp4: codec type=%v is not supported for update", reflect.TypeOf(codec))
+	}
+}
+
+func sameCodec(a, b av.CodecData) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Type() != b.Type() {
+		return false
+	}
+	switch ca := a.(type) {
+	case h264parser.CodecData:
+		cb, ok := b.(h264parser.CodecData)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(ca.SPS(), cb.SPS()) && bytes.Equal(ca.PPS(), cb.PPS())
+	case h265parser.CodecData:
+		cb, ok := b.(h265parser.CodecData)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(ca.VPS(), cb.VPS()) && bytes.Equal(ca.SPS(), cb.SPS()) && bytes.Equal(ca.PPS(), cb.PPS())
+	case aacparser.CodecData:
+		cb, ok := b.(aacparser.CodecData)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(ca.MPEG4AudioConfigBytes(), cb.MPEG4AudioConfigBytes())
+	default:
+		return false
+	}
 }
