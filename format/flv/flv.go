@@ -2,6 +2,7 @@ package flv
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 
@@ -88,8 +89,11 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 				return
 			}
 		}
-		self.Streams[self.VideoStreamIdx] = stream
-		self.Updated = true
+		prev := self.Streams[self.VideoStreamIdx]
+		if !sameVideoCodec(prev, stream) {
+			self.Streams[self.VideoStreamIdx] = stream
+			self.Updated = true
+		}
 		return
 	}
 	if tag.Type == flvio.TAG_AUDIO && tag.SoundFormat == flvio.SOUND_AAC && tag.AACPacketType == flvio.AAC_SEQHDR && self.GotAudio {
@@ -186,6 +190,26 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 	}
 
 	return
+}
+
+func sameVideoCodec(a, b av.CodecData) bool {
+	switch aa := a.(type) {
+	case h264parser.CodecData:
+		bb, ok := b.(h264parser.CodecData)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(aa.SPS(), bb.SPS()) && bytes.Equal(aa.PPS(), bb.PPS())
+	case h265parser.CodecData:
+		bb, ok := b.(h265parser.CodecData)
+		if !ok {
+			return false
+		}
+		return bytes.Equal(aa.SPS(), bb.SPS()) && bytes.Equal(aa.PPS(), bb.PPS()) && bytes.Equal(aa.VPS(), bb.VPS())
+	default:
+		// Unknown type: conservatively treat as different to avoid missing updates.
+		return false
+	}
 }
 
 func (self *Prober) Probed() (ok bool) {

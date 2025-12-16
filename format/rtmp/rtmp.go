@@ -746,7 +746,7 @@ func (self *Conn) connectPlay() (err error) {
 	return
 }
 
-func (self *Conn) ReadPacket() (pkt av.Packet, err error) {
+func (self *Conn) ReadPacketWithCodecUpdate() (pkt av.Packet, updated bool, err error) {
 	if err = self.prepare(stageCodecDataDone, prepareReading); err != nil {
 		return
 	}
@@ -772,6 +772,7 @@ func (self *Conn) ReadPacket() (pkt av.Packet, err error) {
 				self.streams = self.prober.Streams
 				self.streamsUpdated = true
 				self.prober.Updated = false
+				updated = true
 			}
 			continue
 		}
@@ -781,8 +782,11 @@ func (self *Conn) ReadPacket() (pkt av.Packet, err error) {
 			return
 		}
 	}
+}
 
-	return
+func (self *Conn) ReadPacket() (av.Packet, error) {
+	pkt, _, err := self.ReadPacketWithCodecUpdate()
+	return pkt, err
 }
 
 func (self *Conn) Prepare() (err error) {
@@ -839,6 +843,10 @@ func (self *Conn) Streams() (streams []av.CodecData, err error) {
 		return
 	}
 	streams = self.streams
+	if self.prober != nil {
+		self.prober.Updated = false
+	}
+	self.streamsUpdated = false
 	return
 }
 
