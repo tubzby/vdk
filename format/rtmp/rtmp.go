@@ -150,6 +150,8 @@ type Conn struct {
 	writebuf            []byte
 	readbuf             []byte
 	netconn             net.Conn
+	ReadTimeout         time.Duration
+	WriteTimeout        time.Duration
 	txrxcount           *txrxcount
 	writeMaxChunkSize   int
 	readMaxChunkSize    int
@@ -263,6 +265,28 @@ func (self *Conn) Close() (err error) {
 		return self.netconn.Close()
 	}
 	return
+}
+
+func (self *Conn) setReadDeadline() {
+	if self.ReadTimeout > 0 {
+		_ = self.netconn.SetReadDeadline(time.Now().Add(self.ReadTimeout))
+	}
+}
+
+func (self *Conn) setWriteDeadline() {
+	if self.WriteTimeout > 0 {
+		_ = self.netconn.SetWriteDeadline(time.Now().Add(self.WriteTimeout))
+	}
+}
+
+func (self *Conn) readFull(b []byte) (int, error) {
+	self.setReadDeadline()
+	return io.ReadFull(self.bufr, b)
+}
+
+func (self *Conn) write(b []byte) (int, error) {
+	self.setWriteDeadline()
+	return self.bufw.Write(b)
 }
 
 func (self *Conn) pollCommand() (err error) {
@@ -939,7 +963,7 @@ func (self *Conn) writeSetChunkSize(size int) (err error) {
 	n := self.fillChunkHeader(b, 2, 0, msgtypeidSetChunkSize, 0, 4)
 	pio.PutU32BE(b[n:], uint32(size))
 	n += 4
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -948,7 +972,7 @@ func (self *Conn) writeAck(seqnum uint32) (err error) {
 	n := self.fillChunkHeader(b, 2, 0, msgtypeidAck, 0, 4)
 	pio.PutU32BE(b[n:], seqnum)
 	n += 4
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -957,7 +981,7 @@ func (self *Conn) writeWindowAckSize(size uint32) (err error) {
 	n := self.fillChunkHeader(b, 2, 0, msgtypeidWindowAckSize, 0, 4)
 	pio.PutU32BE(b[n:], size)
 	n += 4
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -968,7 +992,7 @@ func (self *Conn) writeSetPeerBandwidth(acksize uint32, limittype uint8) (err er
 	n += 4
 	b[n] = limittype
 	n++
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -992,7 +1016,7 @@ func (self *Conn) writeAMF0Msg(msgtypeid uint8, csid, msgsid uint32, args ...int
 		n += flvio.FillAMF0Val(b[n:], arg)
 	}
 
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 func (self *Conn) fillChunk3Header(b []byte, csid uint32, timestamp uint32) (n int) {
@@ -1055,16 +1079,16 @@ func (self *Conn) weiteAVTagtoChunk(csid uint32, timestamp uint32, msgtypeid uin
 	for msgdatalen+hdrlen > 0 {
 		if pos == 0 {
 			n = self.fillChunk0Header(self.chunkHeaderBuf, csid, timestamp, msgtypeid, msgsid, msgdatalen)
-			n, err = self.bufw.Write(self.chunkHeaderBuf[:n])
+			n, err = self.write(self.chunkHeaderBuf[:n])
 			if err != nil {
 				return
 			}
 		} else {
 			n := self.fillChunk3Header(self.chunkHeaderBuf, csid, timestamp)
-			_, err = self.bufw.Write(self.chunkHeaderBuf[:n])
+			_, err = self.write(self.chunkHeaderBuf[:n])
 		}
 		if msgdatalen > self.writeMaxChunkSize {
-			if sn, err = self.bufw.Write(tag.Data[pos:last]); err != nil {
+			if sn, err = self.write(tag.Data[pos:last]); err != nil {
 				return
 			}
 			pos += sn
@@ -1072,7 +1096,7 @@ func (self *Conn) weiteAVTagtoChunk(csid uint32, timestamp uint32, msgtypeid uin
 			msgdatalen -= sn
 			continue
 		}
-		if sn, err = self.bufw.Write(tag.Data[pos:end]); err != nil {
+		if sn, err = self.write(tag.Data[pos:end]); err != nil {
 			return
 		}
 		pos += sn
@@ -1109,7 +1133,7 @@ func (self *Conn) writeStreamBegin(msgsid uint32) (err error) {
 	n += 2
 	pio.PutU32BE(b[n:], msgsid)
 	n += 4
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -1122,7 +1146,7 @@ func (self *Conn) writeSetBufferLength(msgsid uint32, timestamp uint32) (err err
 	n += 4
 	pio.PutU32BE(b[n:], timestamp)
 	n += 4
-	_, err = self.bufw.Write(b[:n])
+	_, err = self.write(b[:n])
 	return
 }
 
@@ -1169,6 +1193,7 @@ func (self *Conn) fillChunkHeader(b []byte, csid uint32, timestamp int32, msgtyp
 }
 
 func (self *Conn) flushWrite() (err error) {
+	self.setWriteDeadline()
 	if err = self.bufw.Flush(); err != nil {
 		return
 	}
@@ -1178,7 +1203,7 @@ func (self *Conn) flushWrite() (err error) {
 func (self *Conn) readChunk() (err error) {
 	b := self.readbuf
 	n := 0
-	if _, err = io.ReadFull(self.bufr, b[:1]); err != nil {
+	if _, err = self.readFull(b[:1]); err != nil {
 		return
 	}
 	header := b[0]
@@ -1193,13 +1218,13 @@ func (self *Conn) readChunk() (err error) {
 	switch csid {
 	default: // Chunk basic header 1
 	case 0: // Chunk basic header 2
-		if _, err = io.ReadFull(self.bufr, b[:1]); err != nil {
+		if _, err = self.readFull(b[:1]); err != nil {
 			return
 		}
 		n += 1
 		csid = uint32(b[0]) + 64
 	case 1: // Chunk basic header 3
-		if _, err = io.ReadFull(self.bufr, b[:2]); err != nil {
+		if _, err = self.readFull(b[:2]); err != nil {
 			return
 		}
 		n += 2
@@ -1232,7 +1257,7 @@ func (self *Conn) readChunk() (err error) {
 			return
 		}
 		h := b[:11]
-		if _, err = io.ReadFull(self.bufr, h); err != nil {
+		if _, err = self.readFull(h); err != nil {
 			return
 		}
 		n += len(h)
@@ -1242,7 +1267,7 @@ func (self *Conn) readChunk() (err error) {
 		cs.msgtypeid = h[6]
 		cs.msgsid = pio.U32LE(h[7:11])
 		if timestamp == 0xffffff {
-			if _, err = io.ReadFull(self.bufr, b[:4]); err != nil {
+			if _, err = self.readFull(b[:4]); err != nil {
 				return
 			}
 			n += 4
@@ -1269,7 +1294,7 @@ func (self *Conn) readChunk() (err error) {
 			return
 		}
 		h := b[:7]
-		if _, err = io.ReadFull(self.bufr, h); err != nil {
+		if _, err = self.readFull(h); err != nil {
 			return
 		}
 		n += len(h)
@@ -1278,7 +1303,7 @@ func (self *Conn) readChunk() (err error) {
 		cs.msgdatalen = pio.U24BE(h[3:6])
 		cs.msgtypeid = h[6]
 		if timestamp == 0xffffff {
-			if _, err = io.ReadFull(self.bufr, b[:4]); err != nil {
+			if _, err = self.readFull(b[:4]); err != nil {
 				return
 			}
 			n += 4
@@ -1304,14 +1329,14 @@ func (self *Conn) readChunk() (err error) {
 			return
 		}
 		h := b[:3]
-		if _, err = io.ReadFull(self.bufr, h); err != nil {
+		if _, err = self.readFull(h); err != nil {
 			return
 		}
 		n += len(h)
 		cs.msghdrtype = msghdrtype
 		timestamp = pio.U24BE(h[0:3])
 		if timestamp == 0xffffff {
-			if _, err = io.ReadFull(self.bufr, b[:4]); err != nil {
+			if _, err = self.readFull(b[:4]); err != nil {
 				return
 			}
 			n += 4
@@ -1329,7 +1354,7 @@ func (self *Conn) readChunk() (err error) {
 			switch cs.msghdrtype {
 			case 0:
 				if cs.hastimeext {
-					if _, err = io.ReadFull(self.bufr, b[:4]); err != nil {
+					if _, err = self.readFull(b[:4]); err != nil {
 						return
 					}
 					n += 4
@@ -1338,7 +1363,7 @@ func (self *Conn) readChunk() (err error) {
 				}
 			case 1, 2:
 				if cs.hastimeext {
-					if _, err = io.ReadFull(self.bufr, b[:4]); err != nil {
+					if _, err = self.readFull(b[:4]); err != nil {
 						return
 					}
 					n += 4
@@ -1362,7 +1387,7 @@ func (self *Conn) readChunk() (err error) {
 	}
 	off := cs.msgdatalen - cs.msgdataleft
 	buf := cs.msgdata[off : int(off)+size]
-	if _, err = io.ReadFull(self.bufr, buf); err != nil {
+	if _, err = self.readFull(buf); err != nil {
 		return
 	}
 	n += len(buf)
@@ -1613,14 +1638,14 @@ func (self *Conn) handshakeClient() (err error) {
 	S1 := S0S1S2[1 : 1536+1]
 	C0[0] = 3
 
-	if _, err = self.bufw.Write(C0C1); err != nil {
+	if _, err = self.write(C0C1); err != nil {
 		return
 	}
-	if err = self.bufw.Flush(); err != nil {
+	if err = self.flushWrite(); err != nil {
 		return
 	}
 
-	if _, err = io.ReadFull(self.bufr, S0S1S2); err != nil {
+	if _, err = self.readFull(S0S1S2); err != nil {
 		return
 	}
 
@@ -1634,7 +1659,7 @@ func (self *Conn) handshakeClient() (err error) {
 		C2 = S1
 	}
 
-	if _, err = self.bufw.Write(C2); err != nil {
+	if _, err = self.write(C2); err != nil {
 		return
 	}
 
@@ -1656,7 +1681,7 @@ func (self *Conn) handshakeServer() (err error) {
 	S0S1 := S0S1S2[:1536+1]
 	S2 := S0S1S2[1536+1:]
 
-	if _, err = io.ReadFull(self.bufr, C0C1); err != nil {
+	if _, err = self.readFull(C0C1); err != nil {
 		return
 	}
 	if C0[0] != 3 {
@@ -1680,14 +1705,14 @@ func (self *Conn) handshakeServer() (err error) {
 		copy(S2, C1)
 	}
 
-	if _, err = self.bufw.Write(S0S1S2); err != nil {
+	if _, err = self.write(S0S1S2); err != nil {
 		return
 	}
-	if err = self.bufw.Flush(); err != nil {
+	if err = self.flushWrite(); err != nil {
 		return
 	}
 
-	if _, err = io.ReadFull(self.bufr, C2); err != nil {
+	if _, err = self.readFull(C2); err != nil {
 		return
 	}
 
