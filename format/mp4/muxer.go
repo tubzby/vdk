@@ -39,7 +39,7 @@ func (self *Muxer) newStream(codec av.CodecData) (err error) {
 		err = fmt.Errorf("mp4: codec type=%v is not supported", codec.Type())
 		return
 	}
-	stream := &Stream{CodecData: codec}
+	stream := &Stream{CodecData: codec, initialCodec: codec}
 
 	stream.sample = &mp4io.SampleTable{
 		SampleDesc:   &mp4io.SampleDesc{},
@@ -102,8 +102,8 @@ func (self *Muxer) newStream(codec av.CodecData) (err error) {
 func (self *Stream) fillTrackAtom() (err error) {
 	self.trackAtom.Media.Header.TimeScale = int32(self.timeScale)
 	self.trackAtom.Media.Header.Duration = int32(self.duration)
-	if self.Type() == av.H264 {
-		codec := self.CodecData.(h264parser.CodecData)
+	if self.initialCodec.Type() == av.H264 {
+		codec := self.initialCodec.(h264parser.CodecData)
 		width, height := codec.Width(), codec.Height()
 		self.sample.SampleDesc.AVC1Desc = &mp4io.AVC1Desc{
 			DataRefIdx:           1,
@@ -123,10 +123,11 @@ func (self *Stream) fillTrackAtom() (err error) {
 		self.trackAtom.Media.Info.Video = &mp4io.VideoMediaInfo{
 			Flags: 0x000001,
 		}
-		self.trackAtom.Header.TrackWidth = float64(width)
-		self.trackAtom.Header.TrackHeight = float64(height)
-	} else if self.Type() == av.H265 {
-		codec := self.CodecData.(h265parser.CodecData)
+		trackWidth, trackHeight := self.maxDisplaySize(width, height)
+		self.trackAtom.Header.TrackWidth = float64(trackWidth)
+		self.trackAtom.Header.TrackHeight = float64(trackHeight)
+	} else if self.initialCodec.Type() == av.H265 {
+		codec := self.initialCodec.(h265parser.CodecData)
 		width, height := codec.Width(), codec.Height()
 		self.sample.SampleDesc.HV1Desc = &mp4io.HV1Desc{
 			DataRefIdx:           1,
@@ -146,10 +147,11 @@ func (self *Stream) fillTrackAtom() (err error) {
 		self.trackAtom.Media.Info.Video = &mp4io.VideoMediaInfo{
 			Flags: 0x000001,
 		}
-		self.trackAtom.Header.TrackWidth = float64(width)
-		self.trackAtom.Header.TrackHeight = float64(height)
-	} else if self.Type() == av.AAC {
-		codec := self.CodecData.(aacparser.CodecData)
+		trackWidth, trackHeight := self.maxDisplaySize(width, height)
+		self.trackAtom.Header.TrackWidth = float64(trackWidth)
+		self.trackAtom.Header.TrackHeight = float64(trackHeight)
+	} else if self.initialCodec.Type() == av.AAC {
+		codec := self.initialCodec.(aacparser.CodecData)
 		self.sample.SampleDesc.MP4ADesc = &mp4io.MP4ADesc{
 			DataRefIdx:       1,
 			NumberOfChannels: int16(codec.ChannelLayout().Count()),
@@ -168,10 +170,39 @@ func (self *Stream) fillTrackAtom() (err error) {
 		self.trackAtom.Media.Info.Sound = &mp4io.SoundMediaInfo{}
 
 	} else {
-		err = fmt.Errorf("mp4: codec type=%d invalid", self.Type())
+		err = fmt.Errorf("mp4: codec type=%d invalid", self.initialCodec.Type())
 	}
 
 	return
+}
+
+// maxDisplaySize returns the largest display size among the initial sample
+// description (passed in) and the ones appended by UpdateCodec. tkhd carries a
+// single size for the whole track, so a track whose resolution grows mid-file
+// would otherwise be laid out by the initial, smaller size and get the later
+// segments cropped by players that do not re-layout per sample description.
+func (self *Stream) maxDisplaySize(width, height int) (int, int) {
+	if self.sample == nil || self.sample.SampleDesc == nil {
+		return width, height
+	}
+	for _, atom := range self.sample.SampleDesc.Unknowns {
+		var w, h int16
+		switch desc := atom.(type) {
+		case *mp4io.AVC1Desc:
+			w, h = desc.Width, desc.Height
+		case *mp4io.HV1Desc:
+			w, h = desc.Width, desc.Height
+		default:
+			continue
+		}
+		if int(w) > width {
+			width = int(w)
+		}
+		if int(h) > height {
+			height = int(h)
+		}
+	}
+	return width, height
 }
 
 func (self *Muxer) WriteHeader(streams []av.CodecData) (err error) {
@@ -227,11 +258,23 @@ func (self *Stream) writePacket(pkt av.Packet, rawdur time.Duration) (err error)
 	}
 
 	if self.switchSampleIndex > 0 && int64(self.sampleIndex)+1 == self.switchSampleIndex {
-		self.sample.SampleToChunk.Entries = append(self.sample.SampleToChunk.Entries, mp4io.SampleToChunkEntry{
-			FirstChunk:      uint32(len(self.sample.ChunkOffset.Entries) + 1),
-			SamplesPerChunk: 1,
-			SampleDescId:    self.currentSampleDescId,
-		})
+		// One sample per chunk, so the sample about to be written lands in
+		// chunk len(ChunkOffset)+1 (the offset entry is appended below).
+		firstChunk := uint32(len(self.sample.ChunkOffset.Entries) + 1)
+		entries := self.sample.SampleToChunk.Entries
+		// first_chunk must be strictly increasing across stsc entries. When the
+		// switch lands on a chunk the previous entry has not covered yet -- the
+		// very first sample of the file, or two updates without a sample in
+		// between -- retarget that entry instead of appending a duplicate.
+		if n := len(entries); n > 0 && entries[n-1].FirstChunk >= firstChunk {
+			entries[n-1].SampleDescId = self.currentSampleDescId
+		} else {
+			self.sample.SampleToChunk.Entries = append(entries, mp4io.SampleToChunkEntry{
+				FirstChunk:      firstChunk,
+				SamplesPerChunk: 1,
+				SampleDescId:    self.currentSampleDescId,
+			})
+		}
 		self.switchSampleIndex = 0
 	}
 
@@ -347,8 +390,14 @@ func (self *Muxer) UpdateCodec(idx int, codec av.CodecData) error {
 	stream.currentSampleDescId = stream.sampleDescCount
 	stream.sample.SampleDesc.Unknowns = append(stream.sample.SampleDesc.Unknowns, desc)
 	stream.CodecData = codec
-	// switch on the next sample written (not the last buffered one)
+	// switch on the next sample written (not the last buffered one). sampleIndex
+	// counts the samples already flushed, so the next one to be written has
+	// index sampleIndex -- but if WritePacket is still holding a packet, that
+	// packet was produced by the previous codec and takes the slot first.
 	stream.switchSampleIndex = int64(stream.sampleIndex) + 1
+	if stream.lastpkt != nil {
+		stream.switchSampleIndex++
+	}
 	return nil
 }
 

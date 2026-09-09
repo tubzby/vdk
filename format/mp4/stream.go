@@ -10,6 +10,13 @@ import (
 type Stream struct {
 	av.CodecData
 
+	// initialCodec is the codec the stream was created with. UpdateCodec
+	// rewrites CodecData so that sameCodec() can compare against the codec
+	// currently in effect, but the first sample description of the track must
+	// keep describing the samples written before any update happened, so it is
+	// built from this untouched copy instead.
+	initialCodec av.CodecData
+
 	trackAtom *mp4io.Track
 	idx       int
 
